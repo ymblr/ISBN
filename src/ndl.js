@@ -1,5 +1,13 @@
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // NDLサーチ OpenSearch。1冊ずつ呼ぶ前提。429(同時アクセス制限)は待って再試行
+// 表紙: Google Books(NDLに書影が無い本の補完用)。失敗しても登録は止めない
+async function googleCover(isbn) {
+  try {
+    const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&maxResults=1&fields=items(volumeInfo/imageLinks)`);
+    const u = (await r.json()).items?.[0]?.volumeInfo?.imageLinks?.thumbnail;
+    return u ? u.replace('http://', 'https://').replace('&edge=curl', '') : '';
+  } catch { return ''; }
+}
 export async function lookup(isbn) {
   for (let i = 0; i < 4; i++) {
     const res = await fetch('https://ndlsearch.ndl.go.jp/api/opensearch?isbn=' + isbn);
@@ -15,7 +23,7 @@ export async function lookup(isbn) {
     return {
       title: t('title'), volume, author: t('author') || t('dc:creator'),
       authorKana: t('dcndl:creatorTranscription').replace(/[,、]?\s*\d{4}.*$/, ''),
-      publisher: t('dc:publisher'), ndc: ndcs[0]?.s || '', source: 'ndl',
+      publisher: t('dc:publisher'), ndc: ndcs[0]?.s || '', source: 'ndl', cover: await googleCover(isbn),
     };
   }
   throw new Error('NDLが混雑中。少し待ってもう一度');
