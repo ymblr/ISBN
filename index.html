@@ -4,25 +4,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>ISBN scan test</title>
+<title>ISBN scan test v2</title>
 <style>
   body { font-family: -apple-system, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; }
   h2 { font-size: 15px; margin: 20px 0 8px; color: #8cf; }
-  video { width: 100%; max-height: 40vh; background: #000; border-radius: 8px; object-fit: cover; }
+  .cam { position: relative; }
+  video { width: 100%; max-height: 45vh; background: #000; border-radius: 8px; object-fit: cover; display: block; }
+  .guide { position: absolute; left: 5%; right: 5%; top: 30%; bottom: 30%; border: 2px solid #2a7; border-radius: 6px; pointer-events: none; }
   button { font-size: 16px; padding: 10px 16px; border-radius: 8px; border: 0; background: #2a7; color: #fff; margin: 4px 4px 4px 0; }
-  input { font-size: 16px; padding: 8px; border-radius: 8px; border: 1px solid #555; background: #222; color: #fff; width: 60%; }
+  input[type=text], input:not([type]) { font-size: 16px; padding: 8px; border-radius: 8px; border: 1px solid #555; background: #222; color: #fff; width: 60%; }
   pre { background: #222; padding: 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
   .ok { color: #6e6; } .ng { color: #f66; }
 </style>
 </head>
 <body>
-<h2>1. カメラ読み取り(ZXing)</h2>
-<video id="v" playsinline muted></video>
+<h2>1. ライブ読み取り(zxing-wasm)</h2>
+<div class="cam"><video id="v" playsinline muted></video><div class="guide"></div></div>
 <div>
   <button id="start">カメラ開始</button>
   <button id="stop">停止</button>
 </div>
 <pre id="scanLog">待機中</pre>
+
+<h2>1b. 写真で読み取り(ライブがダメなとき用)</h2>
+<input type="file" id="photo" accept="image/*" capture="environment">
+<pre id="photoLog">未実行</pre>
 
 <h2>2. NDLサーチ CORS確認</h2>
 <input id="isbn" inputmode="numeric" value="9784003101018" placeholder="ISBN13">
@@ -32,61 +38,96 @@
 <h2>環境</h2>
 <pre id="env"></pre>
 
-<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.5/dist/iife/reader/index.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const log = (el, msg, cls) => { $(el).innerHTML = (cls ? `<span class="${cls}">` : '') + msg + (cls ? '</span>' : ''); };
+const isIsbn = s => /^97[89]\d{10}$/.test(s);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// 環境表示(ホーム画面追加で起動しているか)
 $('env').textContent = [
   'standalone: ' + (navigator.standalone === true || matchMedia('(display-mode: standalone)').matches),
   'BarcodeDetector: ' + ('BarcodeDetector' in window),
-  'mediaDevices: ' + !!navigator.mediaDevices,
+  'ZXingWASM: ' + (typeof ZXingWASM !== 'undefined'),
   'UA: ' + navigator.userAgent
 ].join('\n');
 
-// --- カメラ ---
-let reader = null;
-const isIsbn = s => /^97[89]\d{10}$/.test(s);
+const OPTS = { formats: ['EAN13'], tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, maxNumberOfSymbols: 2 };
 
+// --- ライブ読み取り ---
+let stream = null, running = false;
 $('start').onclick = async () => {
   try {
-    const { BrowserMultiFormatReader, DecodeHintType, BarcodeFormat } = ZXing;
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13]);
-    hints.set(DecodeHintType.TRY_HARDER, true);
-    reader = new BrowserMultiFormatReader(hints);
+    if (typeof ZXingWASM === 'undefined') throw new Error('zxing-wasmが読み込めてない(CDNブロック?)');
     log('scanLog', 'カメラ起動中...');
-    await reader.decodeFromConstraints(
-      { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } },
-      'v',
-      (result, err) => {
-        if (result) {
-          const t = result.getText();
-          if (isIsbn(t)) {
-            log('scanLog', 'ISBN検出: ' + t, 'ok');
-            $('isbn').value = t;
-          } else {
-            log('scanLog', '検出(ISBNではない・2段目の可能性): ' + t);
-          }
-        }
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+    });
+    const v = $('v'); v.srcObject = stream; await v.play();
+    running = true;
+    const c = document.createElement('canvas'); const ctx = c.getContext('2d', { willReadFrequently: true });
+    let frames = 0, hits = 0, t0 = performance.now();
+    while (running) {
+      const w = v.videoWidth, h = v.videoHeight;
+      if (!w) { await sleep(100); continue; }
+      // 中央の横帯だけ切り出し(バーコードは横長なので帯で十分)
+      const cy = Math.round(h * 0.2), ch = Math.round(h * 0.6);
+      c.width = w; c.height = ch;
+      ctx.drawImage(v, 0, cy, w, ch, 0, 0, w, ch);
+      const t1 = performance.now();
+      const res = await ZXingWASM.readBarcodesFromImageData(ctx.getImageData(0, 0, w, ch), OPTS);
+      frames++;
+      const ms = Math.round(performance.now() - t1);
+      const txts = res.map(r => r.text);
+      const isbn = txts.find(isIsbn);
+      if (isbn) {
+        hits++;
+        $('isbn').value = isbn;
+        log('scanLog', `ISBN検出: ${isbn}\n解析 ${ms}ms / ${frames}フレーム解析済み / 解像度 ${w}x${h}`, 'ok');
+      } else {
+        log('scanLog', `探索中... 解析 ${ms}ms / ${frames}フレーム / 解像度 ${w}x${h}` +
+          (txts.length ? `\n別のコードを検出: ${txts.join(', ')}` : '\n(まだ何も検出なし)'));
       }
-    );
-    log('scanLog', '起動OK。本の裏の「978」始まりのバーコードに向けてね', 'ok');
+      await sleep(80);
+    }
   } catch (e) {
     log('scanLog', 'エラー: ' + e.name + ' / ' + e.message, 'ng');
   }
 };
-$('stop').onclick = () => { if (reader) reader.reset(); log('scanLog', '停止'); };
+$('stop').onclick = () => {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  log('scanLog', '停止');
+};
 
-// --- NDL CORS ---
+// --- 写真から読み取り ---
+$('photo').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    log('photoLog', '解析中...');
+    const res = await ZXingWASM.readBarcodes(f, OPTS);
+    if (!res.length) { log('photoLog', '検出なし(バーコードを大きく・ピントを合わせて撮り直してみて)', 'ng'); return; }
+    const txts = res.map(r => r.text);
+    const isbn = txts.find(isIsbn);
+    if (isbn) { $('isbn').value = isbn; log('photoLog', 'ISBN検出: ' + isbn, 'ok'); }
+    else log('photoLog', '検出: ' + txts.join(', ') + '(ISBNではない)');
+  } catch (err) {
+    log('photoLog', 'エラー: ' + err.name + ' / ' + err.message, 'ng');
+  }
+};
+
+// --- NDL CORS(429のときは自動で数回リトライ) ---
 $('fetchBtn').onclick = async () => {
   const isbn = $('isbn').value.trim();
   const url = 'https://ndlsearch.ndl.go.jp/api/opensearch?isbn=' + encodeURIComponent(isbn);
-  log('ndlLog', '取得中...');
   try {
-    const res = await fetch(url);
-    const text = await res.text();
+    let res, text;
+    for (let i = 1; i <= 4; i++) {
+      log('ndlLog', `取得中... (${i}回目)`);
+      res = await fetch(url); text = await res.text();
+      if (res.status !== 429) break;
+      await sleep(2000 * i);
+    }
     const doc = new DOMParser().parseFromString(text, 'application/xml');
     const items = doc.getElementsByTagName('item');
     const first = items[0];
@@ -95,9 +136,9 @@ $('fetchBtn').onclick = async () => {
     const title = first && first.getElementsByTagName('title')[0]?.textContent;
     log('ndlLog',
       `CORS OK / HTTP ${res.status} / ヒット ${items.length}件\n` +
-      `title: ${title}\n` + (subjects.join('\n') || 'subject なし(NDCなし)') +
+      `title: ${title}\n` + (subjects.join('\n') || 'subject なし(NDCなし or 取得失敗)') +
       `\n\n--- 先頭500文字 ---\n` + text.slice(0, 500).replace(/</g, '&lt;'),
-      'ok');
+      res.ok ? 'ok' : 'ng');
   } catch (e) {
     log('ndlLog', '失敗: ' + e.name + ' / ' + e.message + '\n→ CORSで弾かれた可能性大。中継が必要', 'ng');
   }
