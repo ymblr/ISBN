@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, sendPasswordResetEmail, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import { collection, deleteDoc, doc, onSnapshot, setDoc } from 'firebase/firestore';
-import { readBarcodesFromImageData } from 'zxing-wasm/reader';
+import { readBarcodes, readBarcodesFromImageData } from 'zxing-wasm/reader';
 import { auth, db } from './firebase';
 import { lookup } from './ndl';
 
@@ -91,17 +91,18 @@ function Login() {
 function Scan({ codeRef }) {
   const vref = useRef();
   useEffect(() => {
-    let stop = false, stream;
+    let stop = false, stream, n = 0;
     (async () => {
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
       const v = vref.current; v.srcObject = stream; await v.play();
       const c = document.createElement('canvas'), x = c.getContext('2d', { willReadFrequently: true });
       while (!stop) {
-        const w = v.videoWidth, h = Math.round(v.videoHeight * 0.6);
+        // 3パターンを順番に試す: 中央の帯 / 全体 / 帯+別の二値化(光の反射やカーブしたカバー対策)
+        const w = v.videoWidth, all = n % 3 === 1, h = all ? v.videoHeight : Math.round(v.videoHeight * 0.6);
         if (w) {
           c.width = w; c.height = h;
-          x.drawImage(v, 0, v.videoHeight * 0.2, w, h, 0, 0, w, h);
-          const r = await readBarcodesFromImageData(x.getImageData(0, 0, w, h), { formats: ['EAN13'], tryHarder: true });
+          x.drawImage(v, 0, all ? 0 : v.videoHeight * 0.2, w, h, 0, 0, w, h);
+          const r = await readBarcodesFromImageData(x.getImageData(0, 0, w, h), { formats: ['EAN13'], tryHarder: true, binarizer: n++ % 3 === 2 ? 'GlobalHistogram' : 'LocalAverage' });
           const t = r.map(q => q.text).find(s => /^97[89]\d{10}$/.test(s));
           if (t) await codeRef.current(t); // 検索・保存が終わるまで次を読まない(同時アクセス防止)
         }
@@ -129,17 +130,29 @@ export default function App() {
 
   const addIsbn = async raw => {
     const isbn = toIsbn13(raw);
-    if (!isbn) { setMsg('ISBNの形式が違うよ(10桁か13桁)'); return false; }
+    if (!isbn) { setMsg('ISBNの形式が違うよ(10桁か13桁の数字。入力: ' + raw + ')'); return false; }
     if (booksRef.current.some(b => b.isbn === isbn)) { setMsg('登録済み: ' + isbn); return false; }
     setMsg('検索中… ' + isbn);
     try {
       const b = await lookup(isbn);
-      if (!b) { setForm({ isbn }); setMode('manual'); setMsg('NDLに無い本。手入力してね'); return false; }
-      await save(isbn, { ...b, isbn, createdAt: Date.now() }); setMsg('登録: ' + full(b)); return true;
+      if (!b) { setForm({ isbn }); setMode('manual'); setMsg('NDLにもGoogle Booksにも無かった。手入力してね'); return false; }
+      await save(isbn, { ...b, isbn, createdAt: Date.now() }); setMsg(b.source === 'google' ? 'NDLに無かったのでGoogle Booksの情報で登録(NDCは未設定): ' + full(b) : '登録: ' + full(b)); return true;
     } catch (e) { setMsg('失敗: ' + e.message); return false; }
   };
   codeRef.current = async isbn => { await addIsbn(isbn); await sleep(2000); };
 
+  const readPhoto = async e => {
+    const file = e.target.files[0]; e.target.value = ''; if (!file) return;
+    setMsg('写真を解析中…');
+    try {
+      for (const binarizer of ['LocalAverage', 'GlobalHistogram']) {
+        const r = await readBarcodes(file, { formats: ['EAN13'], tryHarder: true, binarizer });
+        const t = r.map(q => q.text).find(z => /^97[89]\d{10}$/.test(z));
+        if (t) return addIsbn(t);
+      }
+      setMsg('読み取れなかった。バーコードを大きく・ピントを合わせて撮り直すか、「ISBN入力」を使ってね');
+    } catch (err) { setMsg('失敗: ' + err.message); }
+  };
   const go = v => { setView(v); setMsg(''); };
   const f = k => ({ value: form[k] || '', onChange: e => setForm({ ...form, [k]: e.target.value }) });
   const saveForm = async () => {
@@ -210,7 +223,9 @@ export default function App() {
       {view === 'add' && <><h2>本を追加</h2>
         <p>{[['scan', 'バーコード'], ['isbn', 'ISBN入力'], ['manual', '手入力']].map(([k, l]) =>
           <button key={k} className={mode === k ? 'pri' : ''} onClick={() => { setMode(k); setMsg(''); }}>{l}</button>)}</p>
-        {mode === 'scan' && <Scan codeRef={codeRef} />}
+        {mode === 'scan' && <><Scan codeRef={codeRef} />
+          <p><small>上段の「978」で始まるバーコードを枠に合わせてね。読めないときは写真で読み取れる。</small><br />
+            <label className="btn">写真で読み取る<input type="file" accept="image/*" style={{ display: 'none' }} onChange={readPhoto} /></label></p></>}
         {mode === 'isbn' && <p><input inputMode="numeric" placeholder="ISBN(ハイフンなしでもOK)" value={isbnIn} onChange={e => setIsbnIn(e.target.value)} />
           <button className="pri" onClick={async () => { if (await addIsbn(isbnIn)) setIsbnIn(''); }}>検索して登録</button></p>}
         {mode === 'manual' && Form}</>}
